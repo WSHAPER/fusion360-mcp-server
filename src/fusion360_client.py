@@ -2,7 +2,7 @@
 Fusion 360 Real-Time Control Client
 
 This client can connect to the Fusion 360 real-time control server and send commands.
-It can be used from this chat interface to control Fusion 360 directly.
+It provides a Python interface for controlling Fusion 360 from external applications.
 """
 
 import socket
@@ -48,7 +48,7 @@ class Fusion360Client:
             self.socket.send(command_json.encode('utf-8'))
             
             # Receive response
-            response_data = self.socket.recv(4096)
+            response_data = self.socket.recv(8192)
             response = json.loads(response_data.decode('utf-8'))
             
             return response
@@ -110,7 +110,7 @@ class Fusion360Client:
         command = {'type': 'get_server_status'}
         return self.send_command(command)
 
-# Convenience functions for chat use
+# Convenience functions for easy use
 def connect_to_fusion360():
     """Connect to Fusion 360 and return client object."""
     client = Fusion360Client()

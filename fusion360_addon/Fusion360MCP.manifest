@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "c9c3a8b1-8a2d-4c5e-9f7b-1e4d6a8c9b2a",
+    "author": "Claude AI Assistant",
+    "description": {
+        "": "Fusion 360 MCP Integration - Provides real-time chat control and parametric modeling tools through Claude Desktop's Model Context Protocol"
+    },
+    "version": "1.0.0",
+    "runOnStartup": false,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
