@@ -2,18 +2,14 @@
 """
 Fusion 360 MCP Server
 
-This module implements a FastAPI server that exposes Fusion 360 tools as callable endpoints.
-It also implements the Model Context Protocol (MCP) for integration with Cline.
+This module implements a Model Context Protocol (MCP) server for Fusion 360 API integration.
+It follows the JSON-RPC 2.0 specification as required by Claude Desktop.
 """
 
 import json
-import os
 import sys
-from typing import Dict, Any, List, Optional, Union
-
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+import logging
+from typing import Dict, Any, List, Optional
 
 # Import script generator
 from script_generator import (
@@ -23,253 +19,252 @@ from script_generator import (
     TOOLS_BY_NAME,
 )
 
-# Create FastAPI app
-app = FastAPI(
-    title="Fusion 360 MCP Server",
-    description="MCP server for Fusion 360 API integration",
-    version="0.1.0",
-)
+# Set up logging to stderr for debugging
+logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+logger = logging.getLogger(__name__)
 
-# Define request/response models
-class ToolParameter(BaseModel):
-    """Parameter for a tool call."""
-    
-    value: Any = Field(..., description="The parameter value")
-
-
-class ToolCallRequest(BaseModel):
-    """Request to call a single tool."""
-    
-    tool_name: str = Field(..., description="The name of the tool to call")
-    parameters: Dict[str, Any] = Field(
-        default_factory=dict, description="Parameters for the tool call"
-    )
-
-
-class MultiToolCallRequest(BaseModel):
-    """Request to call multiple tools in sequence."""
-    
-    tool_calls: List[ToolCallRequest] = Field(
-        ..., description="List of tool calls to execute in sequence"
-    )
-
-
-class ScriptResponse(BaseModel):
-    """Response containing a generated script."""
-    
-    script: str = Field(..., description="The generated Fusion 360 Python script")
-    message: str = Field(default="Success", description="Status message")
-
-
-class ToolInfo(BaseModel):
-    """Information about a tool."""
-    
-    name: str = Field(..., description="The name of the tool")
-    description: str = Field(..., description="Description of what the tool does")
-    parameters: Dict[str, Dict[str, Any]] = Field(
-        ..., description="Parameters accepted by the tool"
-    )
-    docs: str = Field(..., description="Link to documentation for the tool")
-
-
-class ToolListResponse(BaseModel):
-    """Response containing a list of available tools."""
-    
-    tools: List[ToolInfo] = Field(..., description="List of available tools")
-
-
-# Define API routes
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {"message": "Fusion 360 MCP Server is running"}
-
-
-@app.get("/tools", response_model=ToolListResponse)
-async def list_tools():
-    """List all available tools."""
-    return {"tools": TOOL_REGISTRY}
-
-
-@app.post("/call_tool", response_model=ScriptResponse)
-async def call_tool(request: ToolCallRequest):
-    """Call a single tool and generate a Fusion 360 script."""
-    try:
-        script = generate_script(request.tool_name, request.parameters)
-        return {"script": script, "message": "Success"}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating script: {str(e)}")
-
-
-@app.post("/call_tools", response_model=ScriptResponse)
-async def call_tools(request: MultiToolCallRequest):
-    """Call multiple tools in sequence and generate a Fusion 360 script."""
-    try:
-        tool_calls = [
-            {"tool_name": call.tool_name, "parameters": call.parameters}
-            for call in request.tool_calls
-        ]
-        script = generate_multi_tool_script(tool_calls)
-        return {"script": script, "message": "Success"}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating script: {str(e)}")
-
-
-# MCP Server implementation
-class McpServer:
-    """
-    Model Context Protocol (MCP) server implementation.
-    
-    This class implements the MCP protocol for integration with Cline.
-    It wraps the FastAPI server and exposes tools via the MCP protocol.
-    """
+class MCPServer:
+    """Model Context Protocol server implementation."""
     
     def __init__(self):
         """Initialize the MCP server."""
-        self.tools = {tool["name"]: tool for tool in TOOL_REGISTRY}
+        self.capabilities = {
+            "tools": {}
+        }
     
-    def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_message(self, message: str) -> Optional[str]:
         """
-        Handle an MCP request.
+        Handle an incoming JSON-RPC 2.0 message.
         
         Args:
-            request: The MCP request.
+            message: The raw JSON message string.
             
         Returns:
-            The MCP response.
+            The response JSON string, or None for notifications.
         """
-        method = request.get("method")
+        try:
+            request = json.loads(message.strip())
+        except json.JSONDecodeError as e:
+            return self._create_error_response(
+                None, -32700, f"Parse error: {e}"
+            )
         
-        if method == "list_tools":
-            return self._handle_list_tools()
-        elif method == "call_tool":
-            return self._handle_call_tool(request.get("params", {}))
-        else:
-            return {
-                "error": {
-                    "code": -32601,
-                    "message": f"Method not found: {method}",
-                }
-            }
+        # Extract request components
+        jsonrpc = request.get("jsonrpc")
+        method = request.get("method")
+        params = request.get("params", {})
+        request_id = request.get("id")
+        
+        # Validate JSON-RPC 2.0 format
+        if jsonrpc != "2.0":
+            return self._create_error_response(
+                request_id, -32600, "Invalid Request: jsonrpc must be '2.0'"
+            )
+        
+        if not method:
+            return self._create_error_response(
+                request_id, -32600, "Invalid Request: missing method"
+            )
+        
+        # Handle notifications (no id field)
+        if "id" not in request:
+            self._handle_notification(method, params)
+            return None
+        
+        # Handle requests
+        try:
+            result = self._handle_request(method, params)
+            return self._create_success_response(request_id, result)
+        except Exception as e:
+            logger.error(f"Error handling request {method}: {e}")
+            return self._create_error_response(
+                request_id, -32603, f"Internal error: {e}"
+            )
     
-    def _handle_list_tools(self) -> Dict[str, Any]:
+    def _handle_notification(self, method: str, params: Dict[str, Any]):
+        """Handle a notification (no response expected)."""
+        logger.info(f"Received notification: {method}")
+    
+    def _handle_request(self, method: str, params: Dict[str, Any]) -> Any:
         """
-        Handle a list_tools request.
+        Handle a request and return the result.
+        
+        Args:
+            method: The method name.
+            params: The method parameters.
+            
+        Returns:
+            The result data.
+        """
+        if method == "initialize":
+            return self._handle_initialize(params)
+        elif method == "tools/list":
+            return self._handle_tools_list()
+        elif method == "tools/call":
+            return self._handle_tools_call(params)
+        else:
+            raise ValueError(f"Method not found: {method}")
+    
+    def _handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Handle the initialize request.
+        
+        Args:
+            params: The initialization parameters.
+            
+        Returns:
+            The server capabilities.
+        """
+        logger.info("Initializing MCP server")
+        return {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
+                "name": "fusion360-mcp-server",
+                "version": "0.1.0"
+            }
+        }
+    
+    def _handle_tools_list(self) -> Dict[str, Any]:
+        """
+        Handle the tools/list request.
         
         Returns:
-            The MCP response.
+            The list of available tools.
         """
         tools = []
         for tool in TOOL_REGISTRY:
+            # Convert tool parameters to JSON Schema format
+            properties = {}
+            required = []
+            
+            for param_name, param_info in tool["parameters"].items():
+                prop = {
+                    "type": param_info["type"],
+                    "description": param_info["description"]
+                }
+                
+                # Handle array types
+                if param_info["type"] == "array" and "items" in param_info:
+                    prop["items"] = param_info["items"]
+                
+                properties[param_name] = prop
+                
+                # Add to required if no default value
+                if "default" not in param_info:
+                    required.append(param_name)
+            
             tools.append({
                 "name": tool["name"],
                 "description": tool["description"],
-                "input_schema": {
+                "inputSchema": {
                     "type": "object",
-                    "properties": {
-                        name: {
-                            "type": param["type"],
-                            "description": param["description"],
-                        }
-                        for name, param in tool["parameters"].items()
-                    },
-                    "required": [
-                        name for name, param in tool["parameters"].items()
-                        if "default" not in param
-                    ],
-                },
+                    "properties": properties,
+                    "required": required
+                }
             })
         
-        return {"result": {"tools": tools}}
+        return {"tools": tools}
     
-    def _handle_call_tool(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _handle_tools_call(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Handle a call_tool request.
+        Handle the tools/call request.
         
         Args:
-            params: The parameters for the tool call.
+            params: The tool call parameters.
             
         Returns:
-            The MCP response.
+            The tool call result.
         """
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
         
         if not tool_name:
-            return {
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid params: missing tool name",
-                }
-            }
+            raise ValueError("Missing tool name")
         
-        if tool_name not in self.tools:
-            return {
-                "error": {
-                    "code": -32602,
-                    "message": f"Invalid params: unknown tool: {tool_name}",
-                }
-            }
+        if tool_name not in TOOLS_BY_NAME:
+            raise ValueError(f"Unknown tool: {tool_name}")
         
-        try:
-            script = generate_script(tool_name, arguments)
-            return {
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": script,
-                        }
-                    ]
+        # Generate the Fusion 360 script
+        script = generate_script(tool_name, arguments)
+        
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"Generated Fusion 360 script for {tool_name}:\n\n```python\n{script}\n```\n\nCopy and paste this script into Fusion 360's Scripts and Add-Ins dialog to execute it."
                 }
-            }
-        except ValueError as e:
-            return {
-                "error": {
-                    "code": -32602,
-                    "message": f"Invalid params: {str(e)}",
-                }
-            }
-        except Exception as e:
-            return {
-                "error": {
-                    "code": -32603,
-                    "message": f"Internal error: {str(e)}",
-                }
-            }
-
-
-def run_mcp_server():
-    """Run the MCP server."""
-    server = McpServer()
+            ]
+        }
     
-    # Read from stdin, write to stdout
-    for line in sys.stdin:
-        try:
-            request = json.loads(line)
-            response = server.handle_request(request)
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
-        except json.JSONDecodeError:
-            sys.stderr.write(f"Error: Invalid JSON: {line}\n")
-            sys.stderr.flush()
-        except Exception as e:
-            sys.stderr.write(f"Error: {str(e)}\n")
-            sys.stderr.flush()
+    def _create_success_response(self, request_id: Any, result: Any) -> str:
+        """
+        Create a JSON-RPC 2.0 success response.
+        
+        Args:
+            request_id: The request ID.
+            result: The result data.
+            
+        Returns:
+            The JSON response string.
+        """
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": result
+        }
+        return json.dumps(response)
+    
+    def _create_error_response(self, request_id: Any, code: int, message: str) -> str:
+        """
+        Create a JSON-RPC 2.0 error response.
+        
+        Args:
+            request_id: The request ID.
+            code: The error code.
+            message: The error message.
+            
+        Returns:
+            The JSON response string.
+        """
+        response = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }
+        return json.dumps(response)
 
 
-def run_http_server():
-    """Run the HTTP server."""
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+def main():
+    """Main entry point for the MCP server."""
+    server = MCPServer()
+    
+    logger.info("Starting Fusion 360 MCP Server")
+    
+    try:
+        # Read from stdin and write to stdout
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+                
+            logger.debug(f"Received: {line}")
+            
+            response = server.handle_message(line)
+            if response:
+                print(response, flush=True)
+                logger.debug(f"Sent: {response}")
+    except KeyboardInterrupt:
+        logger.info("Server stopped by user")
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    # Check if running in MCP mode
-    if len(sys.argv) > 1 and sys.argv[1] == "--mcp":
-        run_mcp_server()
-    else:
-        run_http_server()
+    main()
